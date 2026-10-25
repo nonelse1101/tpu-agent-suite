@@ -3,6 +3,7 @@ name: roofline-analysis
 description: Models the analytic roofline of an LLM on TPU — per-op FLOPs, HBM bytes, collective volume, and whether each op is memory, compute or communication bound. Use when asked "what is the hardware floor for this op", "is this memory or compute bound", "how much headroom is there", "model the roofline for this model", "how fast could this kernel possibly be", "estimate KV capacity or max concurrent requests", or to rank optimization candidates before spending hours on a benchmark.
 scripts:
 - scripts/roofline-analysis/roofline.py
+- scripts/roofline-analysis/models.py
 - scripts/roofline-analysis/roofline_model1.py
 - scripts/roofline-analysis/roofline_model2.py
 - scripts/roofline-analysis/serving.py
@@ -13,6 +14,9 @@ scripts:
 - scripts/roofline-analysis/configs/glm-5.2-fp8-128k-1chip-t1024.json
 - scripts/roofline-analysis/configs/glm-5.2-fp8-256k1k-2x2x2.json
 - scripts/roofline-analysis/configs/glm-5.2-fp8-8k1k-2x2x2.json
+- scripts/roofline-analysis/configs/qwen3.5-35b-a3b-bf16-8k1k-2x2x1.json
+- scripts/roofline-analysis/configs/qwen3.5-35b-a3b-fp8-8k1k-1chip.json
+- scripts/roofline-analysis/configs/qwen3.5-35b-a3b-fp8-8k1k-2x2x1.json
 references:
 - references/roofline-analysis
 ---

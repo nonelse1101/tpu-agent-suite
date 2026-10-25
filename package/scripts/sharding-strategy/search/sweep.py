@@ -144,6 +144,7 @@ def model_facts(cfg: R.Config) -> SP.ModelFacts:
         num_kv_heads=max(1, m.kv_heads),
         use_mla=m.use_mla,
         num_layers=m.layers,
+        num_q_heads=m.heads,
     )
 
 

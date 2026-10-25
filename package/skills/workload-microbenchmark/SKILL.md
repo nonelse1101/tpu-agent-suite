@@ -7,6 +7,8 @@ scripts:
 - scripts/workload-microbenchmark/GLM-5.2-FP8/config/agentx-2x2x2-tp16-dcp16-ep.source.json
 - scripts/workload-microbenchmark/GLM-5.2-FP8/config/agentx-2x2x2-tp16-dcp16-ep.twin8.json
 - scripts/workload-microbenchmark/GLM-5.2-FP8/model.py
+- scripts/workload-microbenchmark/Qwen3.5-35B-A3B-BF16/model.py
+- scripts/workload-microbenchmark/Qwen3.5-35B-A3B-FP8/model.py
 - scripts/workload-microbenchmark/Qwen3.5-397B-A17B-FP8/config/qwen3.5-397b-agentx-singlehost-2x2x1-tp8-ep.bars.json
 - scripts/workload-microbenchmark/Qwen3.5-397B-A17B-FP8/config/qwen3.5-397b-agentx-singlehost-2x2x1-tp8-ep.json
 - scripts/workload-microbenchmark/Qwen3.5-397B-A17B-FP8/config/qwen3.5-397b-agentx-singlehost-2x2x1-tp8-ep.source.json
