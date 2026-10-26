@@ -218,6 +218,8 @@ is a second copy that drifts.
 |---|---|---|
 | `qwen3.5-397b-fp8-tp1-dp8-ep`, agent shape | `vllm-torchtpu-generic-eval` | `j-8846a1e0-1b60-4785-944c` |
 | `qwen3.5-35b-bf16-dp8ep8-v6e8`, `fp8_e4m3` KV | `accuracy-check eval_recipe.sh` | `acc-v6e8-dp8ep8-mmlupro-r3` (0.7607 ± 0.0111; paired GPU BF16: 0.7729 ± 0.0110) |
+| `qwen3.5-35b-jax-w8a8-int8moe-v6e8`, `fp8_e4m3` KV | `accuracy-check eval_recipe.sh` | `sea-jp-jax-bf16int8moe-v3` (0.7700 ± 0.0110, -0.29 pp vs GPU BF16; requires `VllmUnquantizedFusedMoEMethod` scale fix) |
+| `qwen3.5-35b-jax-full-w8a8-int8-v6e8`, `fp8_e4m3` KV | `accuracy-check eval_recipe.sh` | `sea-jp-jax-fullint8-v3` (0.7664 ± 0.0110, -0.65 pp vs GPU BF16; requires `VllmUnquantizedFusedMoEMethod` scale fix) |
 | `glm-5.2-fp8-dp16-ep` | `vllm-torchtpu-generic-eval-2node` | `j-012c51a9-a247-4d76-914b` |
 
 Two consequences, and neither is optional:
