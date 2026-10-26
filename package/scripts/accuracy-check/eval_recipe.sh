@@ -124,16 +124,29 @@ echo "effective SERVER_PORT: ${SERVER_PORT}"
 echo "effective VLLM_SERVER_CMD: ${VLLM_SERVER_CMD}"
 echo "effective EVAL_CMD: ${EVAL_CMD}"
 
-# Harness version. Install the pinned fallback only when the image lacks it.
-if ! python3 -c "import lm_eval" 2>/dev/null; then
-  echo "lm_eval not present; installing lm-eval[api]==${LM_EVAL_VERSION}"
-  if command -v uv >/dev/null 2>&1; then
-    uv pip install --system --no-config "lm-eval[api]==${LM_EVAL_VERSION}" || fail "lm_eval install failed"
-  else
-    python3 -m pip install "lm-eval[api]==${LM_EVAL_VERSION}" || fail "lm_eval install failed"
+# Harness version. Install the pinned fallback only when the image lacks it,
+# or into an isolated CPU-torch venv (/opt/lmeval) when system python has
+# torch_tpu autoloaded (which otherwise tries to open /dev/vfio/0 on
+# torch.manual_seed while vllm serve already holds the TPU device).
+LMEVAL_BIN_DIR=""
+if python3 -c "import torch_tpu" 2>/dev/null; then
+  echo "torch_tpu detected in system python; installing lm-eval[api]==${LM_EVAL_VERSION} into isolated CPU venv /opt/lmeval to avoid /dev/vfio/0 contention"
+  python3 -m venv /opt/lmeval || fail "venv /opt/lmeval creation failed"
+  /opt/lmeval/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu || fail "CPU torch install failed"
+  /opt/lmeval/bin/pip install -q "lm-eval[api]==${LM_EVAL_VERSION}" || fail "lm_eval venv install failed"
+  LMEVAL_BIN_DIR="/opt/lmeval/bin"
+  echo "lm_eval version: $(/opt/lmeval/bin/python -c 'import importlib.metadata as m; print(m.version("lm_eval"))' 2>/dev/null || echo unknown)"
+else
+  if ! python3 -c "import lm_eval" 2>/dev/null; then
+    echo "lm_eval not present; installing lm-eval[api]==${LM_EVAL_VERSION}"
+    if command -v uv >/dev/null 2>&1; then
+      uv pip install --system --no-config "lm-eval[api]==${LM_EVAL_VERSION}" || fail "lm_eval install failed"
+    else
+      python3 -m pip install "lm-eval[api]==${LM_EVAL_VERSION}" || fail "lm_eval install failed"
+    fi
   fi
+  echo "lm_eval version: $(python3 -c 'import importlib.metadata as m; print(m.version("lm_eval"))' 2>/dev/null || echo unknown)"
 fi
-echo "lm_eval version: $(python3 -c 'import importlib.metadata as m; print(m.version("lm_eval"))' 2>/dev/null || echo unknown)"
 echo "vllm version: $(python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo unknown)"
 echo "vllm-torchtpu commit: ${VLLM_TORCHTPU_COMMIT:-unknown}"
 
@@ -194,6 +207,9 @@ else:
 PY
 
 # The eval command runs verbatim. Nothing is appended to it.
+if [[ -n "${LMEVAL_BIN_DIR}" ]]; then
+  export PATH="${LMEVAL_BIN_DIR}:${PATH}"
+fi
 eval "${EVAL_CMD}"
 rc=$?
 

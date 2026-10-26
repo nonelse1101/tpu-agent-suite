@@ -110,18 +110,18 @@ Do not rebuild it, do not merge the two below, and do not assume either generali
 in every field that matters. The recipe this skill ships has no default `EVAL_CMD`: it exits
 non-zero without one (see Step 2).
 
-| | **Qwen3.5-397B-A17B-FP8** | **GLM-5.2-FP8** |
-|---|---|---|
-| Task | `mmlu_pro` (see Step 0) | `mmlu_pro` |
-| Baseline recipe | `vllm-torchtpu-generic-eval` | `vllm-torchtpu-generic-eval-2node` |
-| Slice | 1 node, TP=1 / DP=8 / EP | 2 nodes, DP=16 / EP over Ray |
-| `--model_args` form | JSON | comma-kv |
-| `num_concurrent` | 512 | 32 |
-| Thinking disabled | yes, in two places | no |
-| `--log_samples` | yes | no — **add it to a candidate** |
-| `until` | task default | `["<\|im_end\|>"]` |
-| Wall clock, `--limit 100` | 1h29m | 3h53m |
-| Baseline | 0.8250 ± 0.0100 · `j-8846a1e0-1b60-4785-944c` | 0.7500 ± 0.0113 · `j-012c51a9-a247-4d76-914b` |
+| | **Qwen3.5-397B-A17B-FP8** | **Qwen3.5-35B-A3B (BF16 + FP8 KV)** | **GLM-5.2-FP8** |
+|---|---|---|---|
+| Task | `mmlu_pro` (see Step 0) | `mmlu_pro` | `mmlu_pro` |
+| Baseline recipe | `vllm-torchtpu-generic-eval` | `accuracy-check eval_recipe.sh` | `vllm-torchtpu-generic-eval-2node` |
+| Slice | 1 node, TP=1 / DP=8 / EP | 1 node (`v6e-8`), TP=1 / DP=8 / EP | 2 nodes, DP=16 / EP over Ray |
+| `--model_args` form | JSON | JSON | comma-kv |
+| `num_concurrent` | 512 | 512 | 32 |
+| Thinking disabled | yes, in two places | yes, in two places | no |
+| `--log_samples` | yes | yes | no — **add it to a candidate** |
+| `until` | task default | task default | `["<\|im_end\|>"]` |
+| Wall clock, `--limit 100` | 1h29m | 3m10s (after 611s compile) | 3h53m |
+| Baseline | 0.8250 ± 0.0100 · `j-8846a1e0-1b60-4785-944c` | 0.7607 ± 0.0111 · `acc-v6e8-dp8ep8-mmlupro-r3` (GPU BF16 ref: 0.7729 ± 0.0110) | 0.7500 ± 0.0113 · `j-012c51a9-a247-4d76-914b` |
 
 Both baselines: commit `ec4bcecf78`, lm_eval 0.5.0.dev1, n=1400, **0 null-content answers**.
 
@@ -217,6 +217,7 @@ is a second copy that drifts.
 | Model / config | Baseline recipe | Baseline job (`--limit 100`) |
 |---|---|---|
 | `qwen3.5-397b-fp8-tp1-dp8-ep`, agent shape | `vllm-torchtpu-generic-eval` | `j-8846a1e0-1b60-4785-944c` |
+| `qwen3.5-35b-bf16-dp8ep8-v6e8`, `fp8_e4m3` KV | `accuracy-check eval_recipe.sh` | `acc-v6e8-dp8ep8-mmlupro-r3` (0.7607 ± 0.0111; paired GPU BF16: 0.7729 ± 0.0110) |
 | `glm-5.2-fp8-dp16-ep` | `vllm-torchtpu-generic-eval-2node` | `j-012c51a9-a247-4d76-914b` |
 
 Two consequences, and neither is optional:
@@ -507,11 +508,16 @@ and the harness behaviour this skill relies on.
 > 0.7500 ± 0.0113 at n=1400 with **0 null-content answers**, lm_eval 0.5.0.dev1, 3h53m. There is
 > no generic-recipe full-set run for this model.
 >
-> **Two failure modes cost a job each, both fixed by rules above.**
+> **Three failure modes cost a job each, all fixed by rules above and `eval_recipe.sh`.**
 > `j-bd2a68c6-fbad-410f-9e05` died at `ValueError: Weight input_size_per_partition = 64 is not
 > divisible by weight quantization block_k = 128` — TP=8 shards this model's expert `down_proj`
 > below the fp8 block-quant floor; the DP8/TP1 layout is the one that works.
 > `j-09ab11f8-b120-49c0-bed2` died at `--limit-mm-per-prompt: Value image:0 cannot be converted`,
 > the unescaped-JSON trap. Both were red, correctly: the recipe propagates the exit code.
+> `acc-v6e8-dp8ep8-mmlupro-r2` died at `RuntimeError: Bad StatusOr access: INTERNAL: Failed to open
+> /dev/vfio/0: Device or resource busy` when `lm_eval` ran in the container's system Python (where
+> `torch_tpu` is autoloaded and tries to acquire the TPU device on `torch.manual_seed` while `vllm
+> serve` already holds it). Fixed in `eval_recipe.sh` by installing `lm-eval[api]` with CPU-only
+> `torch` into an isolated `/opt/lmeval` venv whenever `torch_tpu` is present in system Python.
 >
 > Correctness of the *model* was not at issue in any of these — they establish the harness.
