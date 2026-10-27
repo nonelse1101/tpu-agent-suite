@@ -1,0 +1,103 @@
+{
+  "_provenance": {
+    "model_pins": "Qwen/Qwen3.5-35B-A3B config.json (text_config), model/architecture/qwen3_5/35B_A3B.md",
+    "hardware_pins": "tpu/V7X.md s2 (GhostFish P3 derated), 2x2x1 single-host (4 chips = 8 devices)",
+    "numerics": "BF16 weights and BF16 KV cache on 10 full-attention layers; BF16 activations, embeddings, LM head, routers, and GDN conv1d; FP32 GDN recurrent state (mamba_ssm_dtype=float32).",
+    "cell": "[8K/1K] TPU v7x 2x2x1 (4 chips / 8 devices, 1 host) -- Qwen3.5-35B-A3B-BF16, default TP2+DP4+EP8",
+    "chunking": "ISL 8192 / OSL 1024, mnbt=1024 per engine."
+  },
+  "model": {
+    "name": "Qwen3.5-35B-A3B-BF16",
+    "layers": 40,
+    "dense_layers": 0,
+    "gdn_layers": 30,
+    "full_attention_interval": 4,
+    "hidden": 2048,
+    "heads": 16,
+    "kv_heads": 2,
+    "head_dim": 256,
+    "attn_output_gate": true,
+    "partial_rotary_factor": 0.25,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "gdn_chunk_size": 64,
+    "mamba_ssm_dtype": "fp32",
+    "moe_dispatch_strategy": "hierarchical_ag",
+    "moe_fused_activation": true,
+    "n_experts": 256,
+    "topk": 8,
+    "expert_ffn": 512,
+    "n_shared_experts": 1,
+    "shared_ffn": 512,
+    "vocab": 248320,
+    "tie_embeddings": false
+  },
+  "numerics": {
+    "default": "bf16",
+    "sites": {
+      "weights": "bf16",
+      "moe_weights": "bf16",
+      "kv_cache": "bf16",
+      "kv_write": "bf16",
+      "act_in": "bf16",
+      "act_out": "bf16",
+      "attn_qk": "bf16",
+      "attn_av": "bf16",
+      "tp_allreduce": "bf16",
+      "expert_dispatch": "bf16",
+      "expert_collect": "bf16",
+      "router_logits": "fp32",
+      "dcp_gather": "fp32"
+    }
+  },
+  "hardware": {
+    "gen": "v7x",
+    "slice_dims": [
+      2,
+      2,
+      1
+    ],
+    "d2d": true,
+    "d2d_bw": 600000000000.0,
+    "ici_bw": 88660000000.0,
+    "hbm_bw": 3364900000000.0,
+    "hbm_capacity": 103079215104,
+    "peak_fp8": 1785620000000000.0,
+    "peak_bf16": 892809000000000.0,
+    "mxu_min_dim": 256,
+    "vmem_bytes": 8388608,
+    "kernel_efficiency": 1.0
+  },
+  "sharding": {
+    "tp": 2,
+    "dp": 4,
+    "pp": 1,
+    "pcp": 1,
+    "dcp": 1,
+    "ep": true,
+    "sp": false
+  },
+  "phases": [
+    {
+      "name": "prefill",
+      "tokens": 8192,
+      "kv_len": 8192,
+      "batch": 1,
+      "mnbt": 1024
+    },
+    {
+      "name": "decode",
+      "tokens": 64,
+      "kv_len": 9216,
+      "batch": 64,
+      "mnbt": 1024
+    }
+  ],
+  "workload": {
+    "isl": 8192,
+    "osl": 1024
+  }
+}

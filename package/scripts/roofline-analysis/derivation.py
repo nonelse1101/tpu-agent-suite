@@ -60,7 +60,7 @@ BLOCKS = (
      ("MoE: FFi", "MoE: FFo", "MoE: SwiGLU", "MoE: permute", "MoE: unpermute",
       "MoE: combine", "MoE: Router (", "MoE: router")),
     ("MoE shared expert", ("MoE: Shared", )),
-    ("attention", ("MLA:", "Attn:")),
+    ("attention", ("MLA:", "Attn:", "GDN:")),
     ("DSA indexer", ("DSA", )),
     ("dense FFN", ("Dense:", )),
     ("norms / residual", ("Norm:", )),

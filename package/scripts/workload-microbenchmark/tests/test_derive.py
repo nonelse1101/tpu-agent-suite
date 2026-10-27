@@ -435,5 +435,83 @@ class SnapshotFormat(unittest.TestCase):
             any(line.startswith('  "script": "xxx') for line in lines))
 
 
+class Qwen35_35B_A3B_AdapterTest(unittest.TestCase):
+    """Unit tests for Qwen3.5-35B-A3B-FP8 and Qwen3.5-35B-A3B-BF16 model adapters."""
+
+    CKPT = {
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "num_hidden_layers": 40,
+            "full_attention_interval": 4,
+            "hidden_size": 2048,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "mamba_ssm_dtype": "float32",
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "mtp_num_hidden_layers": 1,
+            "vocab_size": 248320,
+        },
+        "quantization_config": {
+            "quant_method": "fp8",
+            "modules_to_not_convert": [
+                "model.language_model.layers.0.mlp.gate",
+                "model.language_model.layers.3.mlp.gate",
+            ],
+        },
+    }
+
+    def test_fp8_facts_and_twin_mirror(self):
+        mod = derive.load_model("Qwen3.5-35B-A3B-FP8")
+        f = mod.facts(self.CKPT, kv_cache_dtype="fp8")
+        self.assertEqual(f.layers, 40)
+        self.assertEqual(f.kinds.count("gdn"), 30)
+        self.assertEqual(f.kinds.count("attn"), 10)
+        self.assertEqual(f.kv_cache_bytes_per_token_per_layer, 1024)
+        self.assertEqual(f.kv_bytes_token, 10240)
+        # 30 GDN layers x (2,097,152 B SSM + 49,152 B conv) = 64,389,120 B
+        self.assertEqual(f.state_bytes_seq, 30 * (2_097_152 + 49_152))
+
+        d_tp2 = Deploy(tp=2, dp=4, ep=True, block_size=256, max_model_len=9216)
+        self.assertEqual(mod.kv_bytes_per_token_per_rank(f, d_tp2), 5120.0)
+        rows_tp2 = mod.per_rank_rows(f, d_tp2)
+        self.assertEqual(rows_tp2["attn_kv_heads_per_rank"], 1)
+        self.assertFalse(rows_tp2["attn_kv_replicated"])
+        self.assertEqual(rows_tp2["gdn_k_heads_per_rank"], 8)
+        self.assertEqual(rows_tp2["gdn_v_heads_per_rank"], 16)
+
+        # At TP=8, KV heads (2) replicate so each rank holds 1 KV head
+        d_tp8 = Deploy(tp=8, dp=1, ep=True, block_size=256, max_model_len=9216)
+        rows_tp8 = mod.per_rank_rows(f, d_tp8)
+        self.assertEqual(rows_tp8["attn_kv_heads_per_rank"], 1)
+        self.assertTrue(rows_tp8["attn_kv_replicated"])
+
+        tw = mod.twin_overrides(f, d_tp2, twin_world=8, ckpt=self.CKPT)
+        self.assertEqual(tw["layers"], ["gdn", "attn"])
+        tf = mod.twin_facts(f, tw["hf_overrides"])
+        self.assertEqual(tf.layers, 2)
+        self.assertEqual(tf.kinds, ("gdn", "attn"))
+
+    def test_bf16_facts_and_weights(self):
+        mod_fp8 = derive.load_model("Qwen3.5-35B-A3B-FP8")
+        mod_bf16 = derive.load_model("Qwen3.5-35B-A3B-BF16")
+        f_fp8 = mod_fp8.facts(self.CKPT, kv_cache_dtype="fp8")
+        f_bf16 = mod_bf16.facts(self.CKPT, kv_cache_dtype="bf16")
+        self.assertEqual(f_bf16.kv_bytes_token, 2 * f_fp8.kv_bytes_token)
+        d = Deploy(tp=2, dp=4, ep=True)
+        w_fp8 = mod_fp8.param_bytes_per_rank(f_fp8, d)
+        w_bf16 = mod_bf16.param_bytes_per_rank(f_bf16, d)
+        self.assertGreater(w_bf16["layers"], 1.95 * w_fp8["layers"])
+
+
 if __name__ == "__main__":
     unittest.main()

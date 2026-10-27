@@ -1,0 +1,21 @@
+{
+  "_comment": "Qwen3.5-35B-A3B-BF16 on a 2x2x1 slice (4 chips / 8 devices / 1 host), ISL 8192 / OSL 1024, unified serving. Every architecture pin, numerics site and hardware constant comes from the roofline config named below.",
+  "name": "Qwen3.5-35B-A3B-BF16-2x2x1-8k1k",
+  "roofline_config": "../../roofline-analysis/configs/qwen3.5-35b-a3b-bf16-8k1k-2x2x1.json",
+  "topology": "2x2x1",
+  "d2d": true,
+  "workload": {
+    "isl": 8192,
+    "osl": 1024
+  },
+  "concurrency": 256,
+  "max_num_batched_tokens": 1024,
+  "max_num_seqs": 256,
+  "dispatch_bound": {
+    "enabled": false,
+    "topk": 8,
+    "max_dispatch": 65536,
+    "note": "off by default"
+  },
+  "role": "unified"
+}

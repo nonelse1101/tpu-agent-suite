@@ -9,8 +9,12 @@ scripts:
 - scripts/sharding-strategy/search/selftest.py
 - scripts/sharding-strategy/presets/GLM-5.2-FP8-2x2x2-8k1k.json
 - scripts/sharding-strategy/presets/GLM-5.2-FP8-2x2x2-128k.json
+- scripts/sharding-strategy/presets/Qwen3.5-35B-A3B-BF16-2x2x1-8k1k.json
+- scripts/sharding-strategy/presets/Qwen3.5-35B-A3B-FP8-1chip-2devices-8k1k.json
+- scripts/sharding-strategy/presets/Qwen3.5-35B-A3B-FP8-2x2x1-8k1k.json
 # The roofline modules the search imports, and the configs a preset points at.
 - scripts/roofline-analysis/roofline.py
+- scripts/roofline-analysis/models.py
 - scripts/roofline-analysis/roofline_model1.py
 - scripts/roofline-analysis/roofline_model2.py
 - scripts/roofline-analysis/serving.py
@@ -21,6 +25,9 @@ scripts:
 - scripts/roofline-analysis/configs/glm-5.2-fp8-8k1k-2x2x2.json
 - scripts/roofline-analysis/configs/glm-5.2-fp8-256k1k-2x2x2.json
 - scripts/roofline-analysis/configs/glm-5.2-fp8-128k-1chip-t1024.json
+- scripts/roofline-analysis/configs/qwen3.5-35b-a3b-bf16-8k1k-2x2x1.json
+- scripts/roofline-analysis/configs/qwen3.5-35b-a3b-fp8-8k1k-1chip.json
+- scripts/roofline-analysis/configs/qwen3.5-35b-a3b-fp8-8k1k-2x2x1.json
 references:
 - references/sharding-strategy/CONSTRAINTS.md
 - references/roofline-analysis/parallelism

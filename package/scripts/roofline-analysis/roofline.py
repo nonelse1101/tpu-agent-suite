@@ -101,10 +101,10 @@ class LayerClass:
 class Model:
     name: str
     layers: int
-    dense_layers: int  # first_k_dense_replace
-    indexer_layers: int  # layers that actually RUN the indexer
-    hidden: int
-    heads: int
+    dense_layers: int = 0  # first_k_dense_replace
+    indexer_layers: int = 0  # layers that actually RUN the indexer
+    hidden: int = 0
+    heads: int = 0
     # MLA (kv_lora_rank > 0) or GQA
     kv_lora_rank: int = 0
     q_lora_rank: int = 0
@@ -197,14 +197,49 @@ class Model:
     shared_ffn: int = 0
     vocab: int = 0
     tie_embeddings: bool = False
+    # Hybrid GDN (Gated Delta Network) + Gated GQA (e.g. Qwen3.5-35B-A3B, Qwen3.5-397B-A17B)
+    gdn_layers: int = 0
+    full_attention_interval: int = 4
+    attn_output_gate: bool = False
+    partial_rotary_factor: float = 1.0
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 4
+    gdn_chunk_size: int = 64
+    mamba_ssm_dtype: str = "fp32"
 
     @property
     def moe_layers(self) -> int:
         return self.layers - self.dense_layers
 
     @property
+    def gqa_layers(self) -> int:
+        return self.layers - self.gdn_layers
+
+    @property
     def use_mla(self) -> bool:
         return self.kv_lora_rank > 0
+
+    def is_gdn_layer(self, i: int) -> bool:
+        """True if layer `i` is a GDN linear-attention layer rather than GQA."""
+        if not self.gdn_layers:
+            return False
+        if self.full_attention_interval > 1:
+            return (i + 1) % self.full_attention_interval != 0
+        return i < self.gdn_layers
+
+    def gdn_state_bytes_per_layer(self) -> float:
+        """Unsharded GDN recurrent + conv state bytes per sequence per GDN layer."""
+        if not self.gdn_layers:
+            return 0.0
+        rec = (self.linear_num_value_heads * self.linear_key_head_dim *
+               self.linear_value_head_dim * cc.dtype_bytes(self.mamba_ssm_dtype))
+        d_conv = (2 * self.linear_num_key_heads * self.linear_key_head_dim +
+                  self.linear_num_value_heads * self.linear_value_head_dim)
+        conv = (self.linear_conv_kernel_dim - 1) * d_conv * 2.0
+        return float(rec + conv)
 
     def indexer_layer_ids(self) -> tuple[int, ...]:
         """The layers that run the indexer, by vLLM's rule when it is pinned."""
@@ -220,6 +255,12 @@ class Model:
     @property
     def counts(self) -> dict[str, int]:
         """Layer multiplicities. `moe_idx` layers run the indexer, `moe_plain` reuse it."""
+        if self.gdn_layers > 0:
+            return {
+                "dense": self.dense_layers,
+                "moe_gdn": self.gdn_layers,
+                "moe_gqa": self.gqa_layers - self.dense_layers,
+            }
         idx_on_dense = min(self.dense_layers, self.indexer_layers)
         return {
             "dense": self.dense_layers,
@@ -246,6 +287,14 @@ class Model:
         Empty classes are dropped, so a plain dense model returns one row and a plain
         MoE model two.
         """
+        if self.gdn_layers > 0:
+            spec_gdn = (
+                ("dense", self.dense_layers, ("all", "dense", "gqa")),
+                ("moe_gdn", self.gdn_layers, ("all", "moe", "gdn")),
+                ("moe_gqa", self.gqa_layers - self.dense_layers, ("all", "moe", "gqa")),
+            )
+            return tuple(
+                LayerClass(k, n, frozenset(oc)) for k, n, oc in spec_gdn if n > 0)
         idx_on_dense = min(self.dense_layers, self.indexer_layers)
         spec = (
             ("dense_idx", idx_on_dense, ("all", "dense", "indexer")),
@@ -259,7 +308,7 @@ class Model:
             LayerClass(k, n, frozenset(oc)) for k, n, oc in spec if n > 0)
 
     def __post_init__(self) -> None:
-        if self.dense_layers > self.layers or self.indexer_layers > self.layers:
+        if self.dense_layers > self.layers or self.indexer_layers > self.layers or self.gdn_layers > self.layers:
             raise ValueError(f"{self.name}: layer counts exceed `layers`")
         if sum(self.counts.values()) != self.layers:
             raise ValueError(
@@ -716,9 +765,20 @@ class Ctx:
         self.dc = float(m.kv_lora_rank)
         self.qr = float(m.q_lora_rank)
         self.nope = float(m.qk_nope_head_dim)
-        self.rope = float(m.qk_rope_head_dim or m.head_dim)
+        self.rope = float(
+            m.qk_rope_head_dim or (m.head_dim * m.partial_rotary_factor))
         self.Dv = float(m.v_head_dim or m.head_dim)
         self.dh = float(m.head_dim)
+        self.attn_cls = "gqa" if m.gdn_layers > 0 else "all"
+        self.Hqk_gdn = (max(1.0, m.linear_num_key_heads / self.tp)
+                        if m.gdn_layers else 0.0)
+        self.Hv_gdn = (max(1.0, m.linear_num_value_heads / self.tp)
+                       if m.gdn_layers else 0.0)
+        self.Dk_gdn = float(m.linear_key_head_dim)
+        self.Dv_gdn = float(m.linear_value_head_dim)
+        self.Dconv_gdn = (2 * self.Hqk_gdn * self.Dk_gdn +
+                          self.Hv_gdn * self.Dv_gdn)
+        self.Kconv_gdn = float(m.linear_conv_kernel_dim)
         # compute scans `scan` keys per query; HBM reads `fetch` DISTINCT keys.
         # Under "masked_dense" every query scans the whole context and the mask throws
         # the rest away, so sparsity buys nothing on either axis.
@@ -990,13 +1050,25 @@ GQA_FLASH = "Attn: Flash Attention QK+AV"
 
 
 def gqa_qkv(c):
-    o = (c.H + 2 * c.Hkv) * c.dh
-    return gemm(c, "Attn: QKV Proj", "all", c.T, c.D, o, w=c.D * o, i=c.D, o=o)
+    gate_mult = 2.0 if c.m.attn_output_gate else 1.0
+    o = (gate_mult * c.H + 2 * c.Hkv) * c.dh
+    note = ("includes fused output gate (attn_output_gate=True)"
+            if c.m.attn_output_gate else "")
+    return gemm(c,
+                "Attn: QKV Proj",
+                c.attn_cls,
+                c.T,
+                c.D,
+                o,
+                w=c.D * o,
+                i=c.D,
+                o=o,
+                comment=note)
 
 
 def gqa_qk(c):
     return Op("Attn: QK",
-              "all",
+              c.attn_cls,
               2 * c.T * c.Ha * max(c.dh, c.hw.mxu_min_dim) * c.scan,
               c.n.dt("attn_qk"),
               act_bytes=c.T * c.Ha * c.dh * c.n.b("attn_qk"),
@@ -1007,7 +1079,7 @@ def gqa_qk(c):
 
 def gqa_av(c):
     return Op("Attn: AV",
-              "all",
+              c.attn_cls,
               2 * c.T * c.Ha * max(c.scan, c.hw.mxu_min_dim) * c.dh,
               c.n.dt("attn_av"),
               act_bytes=c.T * c.Ha * c.dh * c.n.b("attn_av"),
@@ -1016,10 +1088,21 @@ def gqa_av(c):
               group=GQA_FLASH)
 
 
+def gqa_output_gate(c):
+    if not c.m.attn_output_gate:
+        return None
+    return vpu(c,
+               "Attn: Output Gate",
+               c.attn_cls,
+               4 * c.T * c.H * c.dh,
+               3 * c.T * c.H * c.dh,
+               comment="sigmoid(gate) * attn_out (attn_output_gate=True)")
+
+
 def gqa_o_proj(c):
     return gemm(c,
                 "Attn: O Proj",
-                "all",
+                c.attn_cls,
                 c.T,
                 c.H * c.dh,
                 c.D,
@@ -1030,7 +1113,107 @@ def gqa_o_proj(c):
 
 GQA_PROJ = [gqa_qkv]
 GQA_ATTN = [gqa_qk, gqa_av]
-GQA_OUT = [gqa_o_proj]
+GQA_OUT = [gqa_output_gate, gqa_o_proj]
+
+# ------------------------------------- GDN  model/common/attention/gdn
+
+
+def gdn_in_proj_qkv(c):
+    o = c.Dconv_gdn
+    return gemm(c,
+                "GDN: In Proj QKV",
+                "gdn",
+                c.T,
+                c.D,
+                o,
+                w=c.D * o,
+                i=c.D,
+                o=o)
+
+
+def gdn_in_proj_zba(c):
+    o = c.Hv_gdn * c.Dv_gdn + 2 * c.Hv_gdn
+    return gemm(c,
+                "GDN: In Proj ZBA",
+                "gdn",
+                c.T,
+                c.D,
+                o,
+                w=c.D * o,
+                i=c.D,
+                o=o,
+                comment="fused z (gate) + b (beta) + a (alpha) projections")
+
+
+def gdn_conv1d(c):
+    state_elems = c.B * (c.Kconv_gdn - 1.0) * c.Dconv_gdn
+    return Op("GDN: Conv1D + SiLU",
+              "gdn",
+              (2 * c.Kconv_gdn + 4) * c.T * c.Dconv_gdn,
+              c.n.dt("act_out"),
+              act_bytes=2 * c.T * c.Dconv_gdn * c.n.b("act_out"),
+              kv_bytes=2 * state_elems * c.n.b("act_out"),
+              kv_resident_bytes=state_elems * c.n.b("act_out"),
+              unit="vpu",
+              comment=f"causal depthwise conv1d (K={int(c.Kconv_gdn)}) + SiLU")
+
+
+def gdn_delta_rule(c):
+    state_b = cc.dtype_bytes(c.m.mamba_ssm_dtype)
+    state_bytes = c.B * c.Hv_gdn * c.Dk_gdn * c.Dv_gdn * state_b
+    act_io = (c.T * (c.Dconv_gdn + 2 * c.Hv_gdn + c.Hv_gdn * c.Dv_gdn) *
+              c.n.b("act_out"))
+    if c.ph.name.startswith("decode"):
+        return Op("GDN: Delta Rule Kernel",
+                  "gdn",
+                  7 * c.T * c.Hv_gdn * c.Dk_gdn * c.Dv_gdn,
+                  c.m.mamba_ssm_dtype,
+                  act_bytes=act_io,
+                  kv_bytes=2 * state_bytes,
+                  kv_resident_bytes=state_bytes,
+                  unit="vpu",
+                  comment="recurrent O(1) state update (read + write fp32 state)")
+    P_c = max(float(c.m.gdn_chunk_size), float(c.hw.mxu_min_dim))
+    P_dk = max(c.Dk_gdn, float(c.hw.mxu_min_dim))
+    flops = c.T * c.Hv_gdn * (4 * P_c * c.Dk_gdn + 2 * P_c * c.Dv_gdn +
+                              6 * P_dk * c.Dv_gdn)
+    return Op("GDN: Delta Rule Kernel",
+              "gdn",
+              flops,
+              c.n.dt("act_out"),
+              act_bytes=act_io,
+              kv_bytes=state_bytes,
+              kv_resident_bytes=state_bytes,
+              unit="mxu",
+              comment=f"chunk-wise scan (C={c.m.gdn_chunk_size}, MXU-padded)")
+
+
+def gdn_rmsnorm_gated(c):
+    elems = c.T * c.Hv_gdn * c.Dv_gdn
+    return vpu(c, "GDN: Gated RMSNorm", "gdn", 8 * elems, 3 * elems)
+
+
+def gdn_out_proj(c):
+    i_dim = c.Hv_gdn * c.Dv_gdn
+    return gemm(c,
+                "GDN: Out Proj",
+                "gdn",
+                c.T,
+                i_dim,
+                c.D,
+                w=i_dim * c.D,
+                i=i_dim,
+                o=c.D)
+
+
+GDN_OPS = [
+    gdn_in_proj_qkv,
+    gdn_in_proj_zba,
+    gdn_conv1d,
+    gdn_delta_rule,
+    gdn_rmsnorm_gated,
+    gdn_out_proj,
+]
 
 # ---------------------------------------------- DSA indexer  model/common/attention/dsa
 
@@ -1428,13 +1611,13 @@ def norm_residual(c):
 
 
 def attn_rope(c):
-    return vpu(c, "Attn: RoPE", "all", (c.H + 1) * c.T * c.rope * 6,
+    return vpu(c, "Attn: RoPE", c.attn_cls, (c.H + 1) * c.T * c.rope * 6,
                2 * c.T * c.H * c.rope)
 
 
 def attn_softmax(c):  # fused -> no HBM, but the VPU work is real
     return Op("Attn: softmax",
-              "all",
+              c.attn_cls,
               3 * c.T * c.Ha * c.scan,
               c.n.dt("attn_av"),
               unit="vpu",
@@ -1497,6 +1680,8 @@ def build_ops(cfg: Config, ph: Phase) -> list[Op]:
                 out.append(o)
 
     add([norm_rmsnorm])
+    if m.gdn_layers:
+        add(GDN_OPS)
     add(MLA_PROJ if m.use_mla else GQA_PROJ)
     add([attn_rope])
     if m.indexer_layers:
@@ -1713,7 +1898,7 @@ def coll_dcp_q_gather(c,
     if c.m.use_mla:  # ql_nope and q_pe, two calls
         return coll(
             "DCP: query head gather",
-            "all",
+            c.attn_cls,
             cc.all_gather(mach, elems_full=e * c.dc, dtype=c.n.dt("attn_qk")),
             cc.all_gather(mach, elems_full=e * c.rope,
                           dtype=c.n.dt("attn_qk")),
@@ -1721,7 +1906,7 @@ def coll_dcp_q_gather(c,
             "dense MLA: no DCP path on TPU -- priced as the sparse merge would be"
         )
     return coll(
-        "DCP: query head gather", "all",
+        "DCP: query head gather", c.attn_cls,
         cc.all_gather(mach, elems_full=e * c.dh, dtype=c.n.dt("attn_qk")))
 
 
@@ -1737,7 +1922,7 @@ def coll_dcp_merge(c,
         # LSE all-gather, then reduce-scatter the LSE-weighted partials along heads
         return coll(
             "DCP: LSE merge",
-            "all",
+            c.attn_cls,
             cc.all_gather(mach, elems_full=e * d, dtype=c.n.dt("dcp_lse")),
             cc.reduce_scatter(mach,
                               elems=e * c.dc,
@@ -1747,7 +1932,7 @@ def coll_dcp_merge(c,
     # GQA: all-gather partials AND LSEs along tokens, fold, slice own heads -- the
     # partial gather stacks dcp copies of an already dcp-wide head axis: dcp^2
     return coll("DCP: LSE merge",
-                "all",
+                c.attn_cls,
                 cc.all_gather(mach,
                               elems_full=e * c.dh * d,
                               dtype=c.n.dt("attn_qk")),
@@ -1771,7 +1956,7 @@ def coll_pcp(c, mach):  # pcp s4 / s6 -- every attention layer
     w = (c.dc + c.rope) if c.m.use_mla else 2 * c.Hkv * c.dh
     if c.ring:
         return coll("PCP: KV ring",
-                    "all",
+                    c.attn_cls,
                     cc.all_gather(mach,
                                   elems_full=c.fetch_all * w,
                                   dtype=c.n.dt("kv_cache")),
@@ -1779,7 +1964,7 @@ def coll_pcp(c, mach):  # pcp s4 / s6 -- every attention layer
                         c, "in-kernel ring over the striped cache; hidden "
                         "behind attention on hardware, charged serially"))
     return coll("PCP: KV all-gather",
-                "all",
+                c.attn_cls,
                 cc.all_gather(mach,
                               elems_full=c.T * c.pcp * w,
                               dtype=c.n.dt("kv_cache")),
@@ -1807,13 +1992,14 @@ def coll_pcp_indexer(c, mach):  # pcp s4 / s6 -- indexer layers; MLA only
 
 
 def multiplicity(m: Model, cls: str) -> int:
-    c = m.counts
     return {
         "all": m.layers,
         "dense": m.dense_layers,
         "moe": m.moe_layers,
-        "indexer": m.indexer_layers
-    }[cls] // max(1, 1) if cls in ("all", "dense", "moe", "indexer") else 0
+        "indexer": m.indexer_layers,
+        "gdn": m.gdn_layers,
+        "gqa": m.gqa_layers,
+    }.get(cls, 0)
 
 
 # ------------------------------------------------ pipeline stages  parallelism/pp/SKILL.md
@@ -1851,13 +2037,21 @@ def layer_costs(cfg: Config, ops: list[Op]) -> list[float]:
     indexer. That asymmetry is why a partition can be unbalanced.
     """
     hw, m = cfg.hardware, cfg.model
-    per = {"all": 0.0, "dense": 0.0, "moe": 0.0, "indexer": 0.0}
+    per = {
+        "all": 0.0,
+        "dense": 0.0,
+        "moe": 0.0,
+        "indexer": 0.0,
+        "gdn": 0.0,
+        "gqa": 0.0,
+    }
     for op in ops:
         if op.layer_class in per:
             per[op.layer_class] += op.roofline_ms(hw)
     idx = set(m.indexer_layer_ids())
     return [
-        per["all"] + (per["dense"] if i < m.dense_layers else per["moe"]) +
+        per["all"] + (per["gdn"] if m.is_gdn_layer(i) else per["gqa"]) +
+        (per["dense"] if i < m.dense_layers else per["moe"]) +
         (per["indexer"] if i in idx else 0.0) for i in range(m.layers)
     ]
 
@@ -2243,8 +2437,22 @@ def _attn_params(m: Model) -> tuple[float, float]:
               m.heads * m.kv_lora_rank * (m.qk_nope_head_dim + m.v_head_dim) +
               m.heads * m.v_head_dim * D)
         return sh, rep
-    return D * (m.heads +
-                2 * m.kv_heads) * m.head_dim + m.heads * m.head_dim * D, 0.0
+    gate_mult = 2.0 if m.attn_output_gate else 1.0
+    return (D * (gate_mult * m.heads + 2 * m.kv_heads) * m.head_dim +
+            m.heads * m.head_dim * D), 0.0
+
+
+def _gdn_attn_params(m: Model) -> float:
+    """TP-sharded linear-projection parameters of ONE GDN layer."""
+    if not m.gdn_layers:
+        return 0.0
+    D = float(m.hidden)
+    d_conv = (2 * m.linear_num_key_heads * m.linear_key_head_dim +
+              m.linear_num_value_heads * m.linear_value_head_dim)
+    d_zba = (m.linear_num_value_heads * m.linear_value_head_dim +
+             2 * m.linear_num_value_heads)
+    d_out = m.linear_num_value_heads * m.linear_value_head_dim
+    return float(D * d_conv + D * d_zba + d_out * D)
 
 
 def _layer_weight_bytes(cfg: Config) -> list[float]:
@@ -2253,7 +2461,8 @@ def _layer_weight_bytes(cfg: Config) -> list[float]:
     t = _per_layer_weight_terms(cfg)
     idx = set(m.indexer_layer_ids())
     return [
-        t["attn"][0] + (t["indexer"][0] if i in idx else 0.0) +
+        (t["gdn"][0] if m.is_gdn_layer(i) else t["attn"][0]) +
+        (t["indexer"][0] if i in idx else 0.0) +
         (t["dense"][0] if i < m.dense_layers else t["moe"][0])
         for i in range(m.layers)
     ]
@@ -2350,13 +2559,33 @@ def weight_terms(cfg: Config) -> list[WeightTerm]:
             "EP off: every core holds every expert, 1/(TP*PCP) of each "
             "one's F columns (parallelism/tp §3)")
     head_rule = "head-sharded by TP; PCP replicates TP's shards (parallelism/tp §3)"
-    terms = [
-        WeightTerm("attention, head-sharded projections", m.layers,
-                   attn * m.layers * wb, tp, "TP", head_rule, stage),
-        WeightTerm("attention, latent down-projections", m.layers,
-                   attn_rep * m.layers * wb, 1, "1",
-                   "no head axis to split -- replicated (parallelism/tp §3)",
-                   stage),
+    if m.gdn_layers > 0:
+        gate_mult = 2.0 if m.attn_output_gate else 1.0
+        gqa_qo = D * (gate_mult + 1.0) * m.heads * m.head_dim
+        gqa_kv = D * 2.0 * m.kv_heads * m.head_dim
+        kv_div = min(tp, max(1, m.kv_heads))
+        gdn_p = _gdn_attn_params(m)
+        attn_terms = [
+            WeightTerm("GDN linear attention projections", m.gdn_layers,
+                       gdn_p * m.gdn_layers * wb, tp, "TP", head_rule, stage),
+            WeightTerm("GQA Q/gate/O projections", m.gqa_layers,
+                       gqa_qo * m.gqa_layers * wb, tp, "TP", head_rule, stage),
+            WeightTerm(
+                "GQA K/V projections", m.gqa_layers,
+                gqa_kv * m.gqa_layers * wb, kv_div, "min(TP, kv_heads)",
+                f"KV heads split by TP up to kv_heads={m.kv_heads}, replicated beyond",
+                stage),
+        ]
+    else:
+        attn_terms = [
+            WeightTerm("attention, head-sharded projections", m.layers,
+                       attn * m.layers * wb, tp, "TP", head_rule, stage),
+            WeightTerm("attention, latent down-projections", m.layers,
+                       attn_rep * m.layers * wb, 1, "1",
+                       "no head axis to split -- replicated (parallelism/tp §3)",
+                       stage),
+        ]
+    terms = attn_terms + [
         # the indexer's projections are replicated too: `wq_b` is ReplicatedLinear and
         # `wk_weights_proj` is MergedColumnParallelLinear(disable_tp=True)
         # (vllm/model_executor/models/deepseek_v2.py:669-683)
@@ -2427,6 +2656,14 @@ def _per_layer_weight_terms(cfg: Config) -> dict[str, tuple[float, float]]:
     D = float(m.hidden)
     attn_sh, attn_rep = (x * wb for x in _attn_params(m))
     attn = attn_sh + attn_rep
+    if not m.use_mla and m.kv_heads > 0 and tp > m.kv_heads:
+        gate_mult = 2.0 if m.attn_output_gate else 1.0
+        qo = D * (gate_mult + 1.0) * m.heads * m.head_dim * wb
+        kv = D * 2.0 * m.kv_heads * m.head_dim * wb
+        attn_local = qo / tp + kv / min(tp, max(1, m.kv_heads))
+    else:
+        attn_local = attn_sh / tp + attn_rep
+    gdn_g = _gdn_attn_params(m) * wb
     idx = (
         (m.q_lora_rank or D) * m.indexer_heads * m.indexer_head_dim + D *
         m.indexer_head_dim) * wb + D * m.indexer_heads * n.b("indexer_w_proj")
@@ -2437,7 +2674,9 @@ def _per_layer_weight_terms(cfg: Config) -> dict[str, tuple[float, float]]:
     expert_div = s.ep_group(
     ) if s.ep else tp * s.pcp  # TP flattened across PCP
     return {
-        "attn": (attn_sh / tp + attn_rep, attn),
+        "attn": (attn_local, attn),
+        "gqa": (attn_local, attn),
+        "gdn": (gdn_g / tp, gdn_g),
         "indexer": (idx, idx),  # replicated, as in weight_bytes
         "dense": (dense / tp, dense),
         # routed experts shard by the EP group with EP on and by TP without it --
@@ -2453,6 +2692,8 @@ _KIND_TERMS = {
     "dense": ("attn", "dense"),
     "moe_idx": ("attn", "indexer", "moe"),
     "moe": ("attn", "moe"),
+    "moe_gdn": ("gdn", "moe"),
+    "moe_gqa": ("gqa", "moe"),
 }
 
 
@@ -2485,8 +2726,13 @@ def layer_occupancy(cfg: Config, ph: Phase) -> dict[str, KindOccupancy]:
         c = float(lc.count)
         wl = sum(terms[t][0] for t in _KIND_TERMS[lc.key]) * c
         wg = sum(terms[t][1] for t in _KIND_TERMS[lc.key]) * c
-        kvl = kv_per_tok * ctx / kv_shard * c
-        kvg = kv_per_tok * ctx * c
+        if lc.key == "moe_gdn":
+            gdn_seq = m.gdn_state_bytes_per_layer() * max(1, ph.batch)
+            kvl = (gdn_seq / s.tp) * c
+            kvg = gdn_seq * c
+        else:
+            kvl = kv_per_tok * ctx / kv_shard * c
+            kvg = kv_per_tok * ctx * c
         if "indexer" in _KIND_TERMS[lc.key]:
             kvl += idx_per_tok * ctx / cp * c
             kvg += idx_per_tok * ctx * c
@@ -2572,6 +2818,14 @@ class KVTerm:
         return self.global_bytes_per_token / self.divisor
 
 
+def _ref_seq_len(cfg: Config) -> float:
+    if cfg.workload is not None and (cfg.workload.isl + cfg.workload.osl) > 0:
+        return float(cfg.workload.isl + cfg.workload.osl)
+    if cfg.phases:
+        return float(max((p.kv_len for p in cfg.phases), default=9216) or 9216)
+    return 9216.0
+
+
 def kv_terms(cfg: Config) -> list[KVTerm]:
     """Per-token cache bytes, cache by cache, before PP. parallelism/{tp,dcp,pcp}/SKILL.md."""
     m, n, s = cfg.model, cfg.numerics, cfg.sharding
@@ -2592,11 +2846,21 @@ def kv_terms(cfg: Config) -> list[KVTerm]:
                 "-- " + cp_rule))
     else:
         h = min(s.tp, max(1, m.kv_heads))
+        label = "GQA K and V" if m.gdn_layers else "K and V"
         out.append(
-            KVTerm("K and V", m.layers,
+            KVTerm(label, m.gqa_layers,
                    2 * m.kv_heads * m.head_dim * n.b("kv_cache"), h * cp,
                    f"min(TP, kv_heads)*{cp_expr}",
                    f"KV heads split by TP up to {m.kv_heads}; " + cp_rule))
+    if m.gdn_layers:
+        seq_len = _ref_seq_len(cfg)
+        out.append(
+            KVTerm(
+                f"GDN recurrent + conv state (O(1)/seq, amortized at S={int(seq_len)})",
+                m.gdn_layers, m.gdn_state_bytes_per_layer() / seq_len, s.tp,
+                "TP",
+                "GDN recurrent state [H_v, D_k, D_v] fp32 + conv state [K-1, D_conv] bf16 split by TP across heads"
+            ))
     if m.indexer_layers and m.indexer_cache_bytes_per_token:
         out.append(
             KVTerm("DSA indexer K cache", m.indexer_layers,
@@ -2620,10 +2884,14 @@ def kv_bytes_per_token(cfg: Config) -> float:
         return sum(t.local_bytes_per_token for t in kv_terms(cfg))
     # the HEAVIEST stage: its attention layers, and only its own indexer layers
     # (`indexer_cache_bytes_per_token` is per indexer layer)
+    gdn_per = (m.gdn_state_bytes_per_layer() / _ref_seq_len(cfg) / s.tp
+               if m.gdn_layers else 0.0)
     idx, out, i = set(m.indexer_layer_ids()), [], 0
     for take in stage_layers(cfg):
         ni = sum(1 for li in range(i, i + take) if li in idx)
-        out.append(per * take / shard + idx_per * ni / cp)
+        n_gdn = sum(1 for li in range(i, i + take) if m.is_gdn_layer(li))
+        n_gqa = take - n_gdn
+        out.append(per * n_gqa / shard + gdn_per * n_gdn + idx_per * ni / cp)
         i += take
     return max(out)
 
@@ -2658,9 +2926,14 @@ def report(cfg: Config, results: list[PhaseResult], top: int) -> None:
     print(
         f"\n{m.name}   {hw.gen} {'x'.join(map(str,hw.slice_dims))} = {hw.world} cores"
         f"   sharding {s.label}")
-    print(
-        f"layers {m.layers} = {c['dense']} dense + {c['moe_idx']} MoE+indexer"
-        f" + {c['moe_plain']} MoE   |   indexer runs on {m.indexer_layers}")
+    if m.gdn_layers:
+        print(
+            f"layers {m.layers} = {c['dense']} dense + {c['moe_gdn']} MoE+GDN"
+            f" + {c['moe_gqa']} MoE+GQA")
+    else:
+        print(
+            f"layers {m.layers} = {c['dense']} dense + {c['moe_idx']} MoE+indexer"
+            f" + {c['moe_plain']} MoE   |   indexer runs on {m.indexer_layers}")
     bad = s.check(hw, m)
     if bad:
         print(f"  note: vLLM would not accept this sharding ({bad}). "
@@ -3788,6 +4061,36 @@ def selftest() -> int:
             self.assertIsNone(Sharding(tp=16, dcp=16).check(hw, m))
             self.assertIn("PCP",
                           Sharding(tp=8, pcp=2, dcp=2).check(hw, m) or "")
+
+        def test_qwen3_5_35b_a3b_hybrid_gdn_and_gqa_reconciles(self):
+            """Qwen3.5-35B-A3B hybrid 30 GDN + 10 gated-GQA layers reconcile on
+            layer classes, op-table weights, weight_terms, and KV/GDN state bytes."""
+            qpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "configs",
+                                 "qwen3.5-35b-a3b-fp8-8k1k-2x2x1.json")
+            qcfg = load(qpath)
+            lcs = {lc.key: lc.count for lc in qcfg.model.layer_classes()}
+            self.assertEqual(lcs, {"moe_gdn": 30, "moe_gqa": 10})
+            self.assertEqual(sum(lcs.values()), qcfg.model.layers)
+            for s in (Sharding(tp=1, dp=8, ep=True), Sharding(tp=2,
+                                                              dp=4,
+                                                              ep=True),
+                      Sharding(tp=4, dp=2, ep=True), Sharding(tp=8,
+                                                              dp=1,
+                                                              ep=True)):
+                c = replace(qcfg, sharding=s)
+                wb = weight_bytes(c)
+                wterms = sum(t.local_bytes for t in weight_terms(c))
+                self.assertAlmostEqual(wb, wterms, places=2)
+                kvb = kv_bytes_per_token(c)
+                kvterms = sum(t.local_bytes_per_token for t in kv_terms(c))
+                self.assertAlmostEqual(kvb, kvterms, places=4)
+                for ph in c.phases:
+                    r = run_phase(c, ph)
+                    self.assertGreater(r.total_ms, 0.0)
+                    lrows = layer_rows(c, ph)
+                    self.assertEqual({x["layer_kind"] for x in lrows},
+                                     {"moe_gdn", "moe_gqa"})
 
     r = unittest.TextTestRunner(verbosity=2).run(
         unittest.TestLoader().loadTestsFromTestCase(T))

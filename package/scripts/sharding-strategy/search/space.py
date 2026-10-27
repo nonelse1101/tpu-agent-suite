@@ -118,6 +118,9 @@ class ModelFacts:
     #: Layer count, for the one PP rule that needs it: a stage cannot hold zero layers.
     #: `0` means "not supplied" and the rule is skipped rather than guessed.
     num_layers: int = 0
+    #: Query head count (optional; when > 0, allows GQA KV head replication for tp > num_kv_heads
+    #: per vLLM QKVParallelLinear, and enforces GQA DCP bounds per vllm/config/model.py:1335-1362).
+    num_q_heads: int = 0
 
     def __post_init__(self) -> None:
         if self.is_moe and self.num_routed_experts <= 0:
@@ -356,11 +359,41 @@ def classify(s: Sharding,
             hard.append(
                 (INFRA, "PCP together with DCP is not implemented on TPU"))
 
-    # Non-MLA models shard KV heads by TP; you cannot split fewer heads than ranks.
-    if not model.use_mla and s.tp > 1 and model.num_kv_heads % s.tp:
-        hard.append(
-            (ARITHMETIC,
-             f"tp={s.tp} does not divide num_kv_heads={model.num_kv_heads}"))
+    # Non-MLA models shard KV heads by TP when tp <= num_kv_heads, or replicate KV heads
+    # across TP ranks when tp > num_kv_heads (vLLM QKVParallelLinear) provided num_q_heads
+    # is supplied and divisible by tp.
+    if not model.use_mla and s.tp > 1:
+        if model.num_q_heads > 0 and s.tp > model.num_kv_heads:
+            if s.tp % model.num_kv_heads or model.num_q_heads % s.tp:
+                hard.append((
+                    ARITHMETIC,
+                    f"tp={s.tp} must be a multiple of num_kv_heads={model.num_kv_heads} "
+                    f"and divide num_q_heads={model.num_q_heads} for GQA KV replication"
+                ))
+        elif model.num_kv_heads % s.tp:
+            hard.append((
+                ARITHMETIC,
+                f"tp={s.tp} does not divide num_kv_heads={model.num_kv_heads}"
+            ))
+    if not model.use_mla and s.dcp > 1:
+        # vllm/config/model.py:1335-1362 -- GQA DCP group shares one replicated KV head
+        if s.tp <= model.num_kv_heads:
+            hard.append((
+                ARITHMETIC,
+                f"GQA DCP needs tp={s.tp} > num_kv_heads={model.num_kv_heads}"
+            ))
+        elif s.dcp > s.tp // model.num_kv_heads:
+            hard.append((
+                ARITHMETIC,
+                f"GQA DCP needs dcp={s.dcp} <= tp // num_kv_heads = {s.tp // model.num_kv_heads}"
+            ))
+        elif model.num_q_heads > 0 and (model.num_q_heads //
+                                        model.num_kv_heads) % s.dcp:
+            hard.append((
+                ARITHMETIC,
+                f"GQA DCP needs (H_q / H_kv)={model.num_q_heads // model.num_kv_heads} "
+                f"divisible by dcp={s.dcp}"
+            ))
 
     # EP. Both are arithmetic: nothing to shard, or a shard count that does not divide.
     if s.ep and not model.is_moe:
